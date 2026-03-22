@@ -8,13 +8,22 @@ on:
         required: true
         type: string
 
+      dump_mode:
+        description: 'Select dump type'
+        required: true
+        type: choice
+        options:
+        - super_only
+        - boot_only
+        - both
+
 env:
   WORKING_DIR: ./firmware_workspace
 
 jobs:
   samsung-fw-dumper:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -35,90 +44,104 @@ jobs:
       uses: rokibhasansagar/slimhub_actions@main
       with:
         retain: 'compiler_cmake'
-    # ends: https://github.com/salvogiangri/UN1CA/blob/be58018b3fc4185078d13035d8f3e7b6af417413/.github/workflows/build.yml#L43
-    
+    # ends
+
     - name: Setup environment
       run: |
         mkdir -p ${{ env.WORKING_DIR }}
         cd ${{ env.WORKING_DIR }}
         echo "WORKSPACE=$(pwd)" >> $GITHUB_ENV
-    
+
     - name: Install required tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget unzip tar lz4 android-sdk-libsparse-utils python3-pip python3 bc
+        sudo apt-get install -y wget unzip tar lz4 jq python3 bc
         
-    # CC: https://github.com/unix3dgforce
     - name: Setup lpunpack
       run: |
-        if [ -f "${{ github.workspace }}/lpunpack.py" ]; then
-          cp "${{ github.workspace }}/lpunpack.py" "${{ env.WORKSPACE }}/lpunpack.py"
-          chmod +x "${{ env.WORKSPACE }}/lpunpack.py"
-        else
-          curl -L -o "${{ env.WORKSPACE }}/lpunpack.py" "https://raw.githubusercontent.com/unix3dgforce/lpunpack/refs/heads/master/lpunpack.py"
-          chmod +x "${{ env.WORKSPACE }}/lpunpack.py"
-        fi
+        curl -L -o "${{ env.WORKSPACE }}/lpunpack.py" "https://raw.githubusercontent.com/unix3dgforce/lpunpack/master/lpunpack.py"
+        chmod +x "${{ env.WORKSPACE }}/lpunpack.py"
 
     - name: Download firmware
       run: |
         cd ${{ env.WORKSPACE }}
         FILENAME=test.zip
         echo "FILENAME=$FILENAME" >> $GITHUB_ENV        
-        wget --save-cookies /dev/null --keep-session-cookies "${{ github.event.inputs.firmware_url }}" -O "$FILENAME"
+        wget "${{ github.event.inputs.firmware_url }}" -O "$FILENAME"
         FILE_SIZE=$(stat -c%s "$FILENAME")
         FILE_SIZE_GB=$(echo "scale=2; $FILE_SIZE / 1073741824" | bc)
         echo "FILE_SIZE_GB=${FILE_SIZE_GB}" >> $GITHUB_ENV
         
-    - name: Extract ZIP if applicable
+    - name: Extract AP only
       run: |
         cd ${{ env.WORKSPACE }}
         unzip -q test.zip -d extracted_zip
         cd extracted_zip
-        find . -name "*.tar.md5" | while read tar_file; do
-          tar -xf "$tar_file"
-        done
+
+        AP_FILE=$(find . -name "AP*.tar.md5" | head -n 1)
+        tar -xf "$AP_FILE"
+
         find . -type f \( -name "*.img" -o -name "*.lz4" \) -exec mv {} ../ \;
         cd ..
         
     - name: Process LZ4 files
       run: |
         cd ${{ env.WORKSPACE }}
-        if [ -f "super.img.lz4" ]; then
-          echo "SUPER_LZ4=true" >> $GITHUB_ENV
-          lz4 -d super.img.lz4 super.img
-        else
-          echo "SUPER_LZ4=false" >> $GITHUB_ENV
-        fi
+        for f in *.lz4; do
+          [ -e "$f" ] || continue
+          lz4 -d "$f" "${f%.lz4}"
+        done
         
-    - name: Extract super.img if present
-      if: env.SUPER_LZ4 == 'true'
+    - name: Extract super.img
+      if: github.event.inputs.dump_mode == 'super_only' || github.event.inputs.dump_mode == 'both'
       run: |
         cd ${{ env.WORKSPACE }}
         mkdir -p extracted_super
         python3 lpunpack.py super.img extracted_super/
+
+        rm -f super.img super.img.lz4
         
-    - name: Upload extracted images to GoFile
-      if: env.SUPER_LZ4 == 'true'
+    - name: Collect boot images
+      if: github.event.inputs.dump_mode == 'boot_only' || github.event.inputs.dump_mode == 'both'
       run: |
-        cd ${{ env.WORKSPACE }}/extracted_super
+        cd ${{ env.WORKSPACE }}
+        mkdir -p boot_images
+
+        for img in boot.img init_boot.img vendor_boot.img dtbo.img; do
+          if [ -f "$img" ]; then
+            cp "$img" boot_images/
+          fi
+        done
+        
+    - name: Upload files to GoFile
+      run: |
+        cd ${{ env.WORKSPACE }}
+
+        mkdir -p upload_all
+
+        if [ -d "extracted_super" ]; then
+          cp extracted_super/*.img upload_all/ 2>/dev/null || true
+        fi
+
+        if [ -d "boot_images" ]; then
+          cp boot_images/*.img upload_all/ 2>/dev/null || true
+        fi
+
+        cd upload_all
 
         SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
 
         for img in *.img; do
-            echo "Uploading $img to GoFile..."
             LINK=$(curl -s -F "file=@${img}" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
-            echo "$img => $LINK"
-            echo "$img: $LINK" >> ${{ env.WORKSPACE }}/gofile_links.txt
+            echo "$img: $LINK" >> ../gofile_links.txt
         done
-    
-    - name: GoFile links
-      if: env.SUPER_LZ4 == 'true'
+
+    - name: Zip links
       run: |
-        echo "=== GoFile Download Links ==="
-        cat ${{ env.WORKSPACE }}/gofile_links.txt
-    
-    - name: Upload GoFile links text file
-      if: env.SUPER_LZ4 == 'true'
+        cd ${{ env.WORKSPACE }}
+        zip gofile_links.zip gofile_links.txt
+
+    - name: Upload links
       uses: actions/upload-artifact@v4
       with:
         name: gofile-links
@@ -132,6 +155,6 @@ jobs:
 
     - name: Summary
       run: |
+        echo "Mode: ${{ github.event.inputs.dump_mode }}"
         echo "Input URL: ${{ github.event.inputs.firmware_url }}"
         echo "Original size: ${{ env.FILE_SIZE_GB }}GB"
-        echo "Super.img found: ${{ env.SUPER_LZ4 }}"
