@@ -79,7 +79,7 @@ jobs:
     - name: Install required tools
       run: |
         set -euo pipefail
-        sudo apt-get update
+        sudo apt-get update || echo "Warning: apt-get update hit an unreachable/broken mirror, continuing with whatever mirrors succeeded."
         sudo apt-get install -y wget unzip tar lz4 jq python3 bc
 
     - name: Setup lpunpack
